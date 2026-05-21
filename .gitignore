@@ -216,3 +216,17 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# --- Project-specific ---
+
+# Model checkpoints (large binaries).
+checkpoints/
+*.pt
+*.bin
+*.safetensors
+
+# Weights & Biases local run logs.
+wandb/
+
+# macOS
+.DS_Store
