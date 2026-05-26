@@ -1,26 +1,30 @@
-"""Fine-tune GPT-2 Small on the per-artist lyric splits produced by data.py.
-
-- Adds <ARTIST: name> control tokens as special tokens so they aren't BPE-split.
-- Weighted sampling so each artist is seen roughly equally despite uneven counts.
-- AdamW + cosine LR schedule with warmup, gradient clipping.
-- Logs per-artist val loss and per-artist sampled exposure to Weights & Biases.
-
-Usage:
-    python train.py                          # defaults
-    python train.py --epochs 5 --lr 3e-5     # override anything
-    python train.py --no-wandb               # skip wandb (smoke test)
 """
+fine-tune GPT-2 small on the per-artist lyric splits from data.py.
 
-from __future__ import annotations
+the artist tags `<ARTIST: name>` are registered as special tokens so the BPE
+doesn't split them. weighted sampling keeps each artist roughly equally
+represented since song counts are uneven. AdamW + cosine schedule with warmup.
+per-artist val loss + exposure get logged to wandb.
+
+usage:
+    python train.py
+    python train.py --epochs 5 --lr 3e-5
+    python train.py --no-wandb     # smoke test, skips wandb
+"""
 
 import argparse
 import json
 import logging
 import math
+import os
 import random
 import time
 from collections import Counter
 from pathlib import Path
+
+# shut up the "process just got forked" warning from tokenizers when the
+# dataloader spawns workers. has to happen before the transformers import.
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
 import torch
 import torch.nn.functional as F
@@ -36,9 +40,9 @@ from data import ARTISTS, PROCESSED_DIR
 PROJECT_ROOT = Path(__file__).resolve().parent
 CKPT_DIR = PROJECT_ROOT / "checkpoints"
 
-# Defaults — overridable via CLI.
+# defaults, can override from CLI
 MODEL_NAME = "gpt2"
-BLOCK_SIZE = 512
+BLOCK_SIZE = 1024
 BATCH_SIZE = 4
 EPOCHS = 3
 LR = 5e-5
@@ -56,16 +60,14 @@ logging.basicConfig(
 log = logging.getLogger("train")
 
 
-def set_seed(seed: int) -> None:
-    """Seed Python, NumPy-free torch, and CUDA for reproducibility."""
+def set_seed(seed):
     random.seed(seed)
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
 
 
-def pick_device() -> str:
-    """Use CUDA if available, else Apple MPS, else CPU."""
+def pick_device():
     if torch.cuda.is_available():
         return "cuda"
     if torch.backends.mps.is_available():
@@ -73,20 +75,16 @@ def pick_device() -> str:
     return "cpu"
 
 
-def load_split(name: str) -> list[dict]:
+def load_split(name):
     path = PROCESSED_DIR / f"{name}.jsonl"
     if not path.exists():
-        raise SystemExit(f"Missing {path} — run `python data.py` first.")
+        raise SystemExit(f"Missing {path}. Run `python data.py` first.")
     return [json.loads(line) for line in path.open()]
 
 
 class LyricsDataset(Dataset):
-    """Tokenized lyric examples carrying their artist label.
-
-    Each item: {input_ids, attention_mask, labels, artist}.
-    Padding positions in `labels` are set to -100 so the LM loss ignores them.
-    """
-
+    # each example is {input_ids, attention_mask, labels, artist}
+    # pad positions in labels get set to -100 so the LM loss skips them
     def __init__(self, rows, tokenizer, block_size):
         self.examples = []
         truncated = 0
@@ -111,7 +109,7 @@ class LyricsDataset(Dataset):
                 "artist": r["artist"],
             })
         if truncated:
-            log.info("  %d/%d examples hit the %d-token cap (truncated).",
+            log.info("  %d/%d examples hit the %d-token cap and got truncated",
                      truncated, len(rows), block_size)
 
     def __len__(self):
@@ -130,8 +128,9 @@ def collate(batch):
     }
 
 
-def build_weighted_sampler(train_ds: LyricsDataset) -> WeightedRandomSampler:
-    """Per-example weight = 1 / count(its artist). Balances per-artist exposure."""
+def build_weighted_sampler(train_ds):
+    # weight each example by 1/count(its artist) so all 9 artists get
+    # roughly equal exposure even though song counts are uneven
     counts = Counter(ex["artist"] for ex in train_ds.examples)
     weights = [1.0 / counts[ex["artist"]] for ex in train_ds.examples]
     return WeightedRandomSampler(
@@ -140,10 +139,10 @@ def build_weighted_sampler(train_ds: LyricsDataset) -> WeightedRandomSampler:
 
 
 @torch.no_grad()
-def per_artist_val_loss(model, val_loader, device) -> dict[str, float]:
-    """Mean CE loss on val, grouped by artist tag."""
+def per_artist_val_loss(model, val_loader, device):
+    # mean CE loss on val, grouped by artist tag
     model.eval()
-    by_artist: dict[str, list[float]] = {a: [] for a in ARTISTS}
+    by_artist = {a: [] for a in ARTISTS}
     for batch in val_loader:
         input_ids = batch["input_ids"].to(device)
         attn = batch["attention_mask"].to(device)
@@ -151,11 +150,11 @@ def per_artist_val_loss(model, val_loader, device) -> dict[str, float]:
         out = model(input_ids=input_ids, attention_mask=attn)
         logits = out.logits[..., :-1, :].contiguous()
         target = labels[..., 1:].contiguous()
-        # Per-token CE, then mean over non-ignored positions for each example.
         ce = F.cross_entropy(
             logits.transpose(1, 2), target,
             reduction="none", ignore_index=-100,
         )
+        # average over non-padding positions for each example separately
         mask = (target != -100).float()
         per_example = (ce * mask).sum(dim=1) / mask.sum(dim=1).clamp(min=1)
         for art, l in zip(batch["artists"], per_example.tolist()):
@@ -171,7 +170,7 @@ def train(args):
     device = pick_device()
     log.info("Device: %s", device)
 
-    # Tokenizer + control tokens.
+    # tokenizer + the artist control tokens
     tokenizer = GPT2TokenizerFast.from_pretrained(MODEL_NAME)
     artist_tokens = [f"<ARTIST: {a}>" for a in ARTISTS]
     added = tokenizer.add_special_tokens({
@@ -180,7 +179,6 @@ def train(args):
     })
     log.info("Added %d special tokens. Vocab size: %d", added, len(tokenizer))
 
-    # Data.
     log.info("Tokenizing splits...")
     train_ds = LyricsDataset(load_split("train"), tokenizer, args.block_size)
     val_ds = LyricsDataset(load_split("val"), tokenizer, args.block_size)
@@ -196,14 +194,13 @@ def train(args):
         shuffle=False, collate_fn=collate,
     )
 
-    # Model.
     model = GPT2LMHeadModel.from_pretrained(MODEL_NAME)
     model.resize_token_embeddings(len(tokenizer))
     model.to(device)
     n_params = sum(p.numel() for p in model.parameters())
     log.info("Model params: %.1fM", n_params / 1e6)
 
-    # Optimizer (no weight decay on biases/LayerNorm) + cosine schedule.
+    # standard AdamW: no weight decay on biases or LayerNorm weights
     no_decay = ("bias", "LayerNorm.weight")
     grouped = [
         {"params": [p for n, p in model.named_parameters()
@@ -221,7 +218,6 @@ def train(args):
         num_training_steps=total_steps,
     )
 
-    # wandb.
     use_wandb = not args.no_wandb
     if use_wandb:
         import wandb
@@ -244,10 +240,9 @@ def train(args):
             },
         )
 
-    # Train loop.
     CKPT_DIR.mkdir(exist_ok=True)
     best_val = float("inf")
-    exposure: Counter[str] = Counter()
+    exposure = Counter()
     global_step = 0
     t0 = time.time()
 
@@ -297,7 +292,7 @@ def train(args):
             best_dir = CKPT_DIR / "best"
             model.save_pretrained(best_dir)
             tokenizer.save_pretrained(best_dir)
-            log.info("Saved best → %s (val %.3f)", best_dir, best_val)
+            log.info("Saved best to %s (val %.3f)", best_dir, best_val)
 
     final_dir = CKPT_DIR / "final"
     model.save_pretrained(final_dir)
