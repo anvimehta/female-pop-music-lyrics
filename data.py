@@ -68,16 +68,17 @@ def clean_lyrics(raw: str) -> str:
     return text.strip()
 
 
-def scrape_artist(genius, artist: str, max_songs: int) -> list[dict]:
-    """Pull up to max_songs from Genius, sorted by popularity.
+def scrape_artist(genius, artist: str, max_songs):
+    """Pull up to max_songs from Genius (None or 0 = no cap, all songs).
 
     Returns [{title, lyrics}, ...]. Songs with empty lyrics are dropped with
     an explicit warning so failures aren't silent.
     """
-    log.info("Scraping %s (cap=%d)...", artist, max_songs)
+    cap = None if not max_songs or max_songs <= 0 else max_songs
+    log.info("Scraping %s (cap=%s)...", artist, "all" if cap is None else cap)
     result = genius.search_artist(
         artist,
-        max_songs=max_songs,
+        max_songs=cap,
         sort="popularity",
         include_features=False,
     )
@@ -228,7 +229,7 @@ def main() -> None:
     p.add_argument("--process", action="store_true", help="Run the clean/split phase.")
     p.add_argument(
         "--max-per-artist", type=int, default=100,
-        help="Cap on songs pulled per artist (default 100; target ~750–800 total).",
+        help="Cap on songs pulled per artist (default 100). Pass 0 for no cap.",
     )
     p.add_argument("--val-frac", type=float, default=0.1)
     p.add_argument("--test-frac", type=float, default=0.1)
