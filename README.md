@@ -57,10 +57,6 @@ Checkpoints land in `checkpoints/best/` (lowest val loss) and
 `checkpoints/final/`.
 
 ## 3. Eval
-
-Runs both evaluation tracks from `CLAUDE.md` and writes everything to
-`eval_results/`:
-
 ```bash
 python eval.py                          # PPL grid + stylometry + generation
 python eval.py --skip-generate          # PPL + stylometry of reals only
