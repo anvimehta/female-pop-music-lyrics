@@ -99,7 +99,6 @@ The model loads once at startup; each click reuses it.
 
 ```
 .
-├── CLAUDE.md            # project spec for Claude Code
 ├── README.md
 ├── requirements.txt
 ├── data.py              # scrape, clean, format, split
